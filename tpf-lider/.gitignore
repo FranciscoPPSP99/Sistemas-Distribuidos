@@ -3,3 +3,8 @@ target/
 .env.*
 discord-token.txt
 master.key
+
+registos.log
+eventos-lider.txt
+selados/
+.master-key-*.tmp

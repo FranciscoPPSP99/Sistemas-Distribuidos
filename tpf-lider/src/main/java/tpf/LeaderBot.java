@@ -1,8 +1,12 @@
 package tpf;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
@@ -27,23 +31,42 @@ public final class LeaderBot extends ListenerAdapter {
 
     private final String guildId;
 
-    private LeaderBot(String guildId) {
+    private final Arquivo arquivo;
+    private final ExecutorService escritas = Executors.newSingleThreadExecutor();
+    private final ExecutorService rajadas = Executors.newSingleThreadExecutor();
+
+    private LeaderBot(String guildId, Arquivo arquivo) {
         this.guildId = guildId;
+        this.arquivo = arquivo;
     }
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, IOException {
         String token = requiredEnvironmentVariable("DISCORD_BOT_TOKEN");
         String guildId = requiredEnvironmentVariable("DISCORD_GUILD_ID");
         if (!guildId.matches("[0-9]{17,20}")) {
             throw new IllegalArgumentException("DISCORD_GUILD_ID deve conter o ID do servidor.");
         }
 
-        LeaderBot bot = new LeaderBot(guildId);
-        JDA jda = JDABuilder.createLight(token,
-                        EnumSet.of(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT))
-                .addEventListeners(bot)
-                .build();
+        byte[] chave = MasterKey.loadOrCreate(Path.of("master.key"));
+        var relogio = Executors.newSingleThreadScheduledExecutor();
+        LeaderBot bot;
         try {
+            bot = new LeaderBot(guildId, new Arquivo(Path.of("."), chave, relogio));
+        } catch (IOException | RuntimeException failure) {
+            relogio.shutdownNow();
+            throw failure;
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            bot.escritas.shutdownNow();
+            bot.rajadas.shutdownNow();
+            relogio.shutdownNow();
+        }));
+        JDA jda = null;
+        try {
+            jda = JDABuilder.createLight(token,
+                            EnumSet.of(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT))
+                    .addEventListeners(bot)
+                    .build();
             jda.awaitReady();
             Guild guild = jda.getGuildById(guildId);
             if (guild == null) {
@@ -52,7 +75,12 @@ public final class LeaderBot extends ListenerAdapter {
             bot.registerCommands(guild);
             System.out.println("LeaderBot online. Sete comandos registados no servidor " + guild.getName() + ".");
         } catch (InterruptedException | RuntimeException failure) {
-            jda.shutdownNow();
+            if (jda != null) {
+                jda.shutdownNow();
+            }
+            bot.escritas.shutdownNow();
+            bot.rajadas.shutdownNow();
+            relogio.shutdownNow();
             throw failure;
         }
     }
@@ -105,14 +133,19 @@ public final class LeaderBot extends ListenerAdapter {
         }
 
         try {
+            if ("registar".equals(command)) {
+                registarComando(event, textArgument(event, "texto"));
+                return;
+            }
+            if ("rajada".equals(command)) {
+                rajada(event, integerArgument(event, "n", 1), integerArgument(event, "intervaloms", 0));
+                return;
+            }
             String arguments = switch (command) {
-                case "registar" -> "texto=" + textArgument(event, "texto");
                 case "estado", "replica-token" -> "";
                 case "config" -> "n=" + integerArgument(event, "n", 1);
                 case "recuperar" -> recoveryArguments(event);
                 case "replica-remover" -> "id=" + textArgument(event, "id");
-                case "rajada" -> "n=" + integerArgument(event, "n", 1)
-                        + ", intervaloMs=" + integerArgument(event, "intervaloms", 0);
                 default -> throw new IllegalArgumentException("Comando desconhecido.");
             };
             String commandPath = "config".equals(command) ? "config r" : command;
@@ -121,6 +154,51 @@ public final class LeaderBot extends ListenerAdapter {
         } catch (IllegalArgumentException failure) {
             reply(event, "Erro: " + failure.getMessage(), true);
         }
+    }
+
+    private void registarComando(SlashCommandInteractionEvent event, String texto) {
+        String autor = event.getUser().getId();
+        String canal = event.getChannel().getId();
+        event.deferReply().queue(hook -> escritas.execute(() -> {
+            String resposta;
+            try {
+                resposta = "Registado com LSN " + arquivo.registar(autor, canal, texto) + ".";
+            } catch (IOException failure) {
+                resposta = erroDeEscrita(failure);
+            }
+            hook.editOriginal(resposta).queue();
+        }));
+    }
+
+    private void rajada(SlashCommandInteractionEvent event, long n, long intervaloMs) {
+        String autor = event.getUser().getId();
+        String canal = event.getChannel().getId();
+        event.reply("Rajada de " + n + " registos agendada.").setEphemeral(true).queue(hook ->
+                rajadas.execute(() -> {
+                    long escritos = 0;
+                    try {
+                        while (escritos < n) {
+                            String texto = "Registo sintético de rajada " + (escritos + 1) + " "
+                                    + "0123456789abcdef".repeat(20);
+                            arquivo.registar(autor, canal, texto);
+                            escritos++;
+                            if (escritos < n && intervaloMs > 0) {
+                                Thread.sleep(intervaloMs);
+                            }
+                        }
+                        hook.editOriginal("Rajada concluída. Registos confirmados: " + escritos + ".").queue();
+                    } catch (IOException failure) {
+                        hook.editOriginal("Rajada interrompida após " + escritos + " confirmações. "
+                                + erroDeEscrita(failure)).queue();
+                    } catch (InterruptedException failure) {
+                        Thread.currentThread().interrupt();
+                    }
+                }));
+    }
+
+    private static String erroDeEscrita(IOException failure) {
+        failure.printStackTrace(System.err);
+        return "Não foi possível confirmar o registo. Consulta o terminal do líder.";
     }
 
     private static String recoveryArguments(SlashCommandInteractionEvent event) {
@@ -160,6 +238,17 @@ public final class LeaderBot extends ListenerAdapter {
                 || !ARCHIVE_CHANNEL.equals(event.getChannel().getName())) {
             return;
         }
-        event.getChannel().sendMessage("Mensagem recebida em #arquivo. O registo ainda está por implementar.").queue();
+        String autor = event.getAuthor().getId();
+        String canal = event.getChannel().getId();
+        String texto = event.getMessage().getContentRaw();
+        escritas.execute(() -> {
+            String resposta;
+            try {
+                resposta = "Registado com LSN " + arquivo.registar(autor, canal, texto) + ".";
+            } catch (IOException failure) {
+                resposta = erroDeEscrita(failure);
+            }
+            event.getChannel().sendMessage(resposta).queue();
+        });
     }
 }

@@ -1,6 +1,6 @@
-# tpf-lider — Sprint E2-01
+# tpf-lider — Sprint E2-02
 
-Base do bot Discord em Java 17 e JDA. Neste sprint, o bot valida os comandos e dá respostas provisórias, incluindo a mensagens em `#arquivo`.
+Bot Discord em Java 17 e JDA. O líder grava registos localmente, agrupa-os em chunks e guarda os chunks selados com cifra autenticada.
 
 ## 1. Preparar o Discord
 
@@ -16,7 +16,7 @@ Com JDK 17 ou superior e Maven instalados, abre o PowerShell dentro da pasta `tp
 ```powershell
 java -version
 mvn -version
-mvn clean compile
+mvn clean test
 
 $env:DISCORD_GUILD_ID = Read-Host "ID do servidor de teste"
 $env:DISCORD_BOT_TOKEN = (Get-Credential -UserName "bot" -Message "Cola o token do bot no campo Palavra-passe").GetNetworkCredential().Password
@@ -36,15 +36,15 @@ $env:Path = "$env:JAVA_HOME/bin;$env:TEMP/e2-maven/apache-maven-3.9.11/bin;$env:
 
 Confirma que o bot aparece online. Escreve `/` no Discord e experimenta os sete comandos com uma conta que tenha o papel `admin-arquivo`:
 
-| Comando de teste | Argumentos esperados na resposta provisória |
+| Comando de teste | Resultado esperado |
 | --- | --- |
-| `/registar texto:Olá` | `texto=Olá` |
+| `/registar texto:Olá` | Confirmação com o LSN atribuído |
 | `/estado` | Nenhum |
 | `/config r n:3` | `n=3` |
 | `/recuperar de:10 ate:20` | `de=10, ate=20` |
 | `/replica-token` | Nenhum |
 | `/replica-remover id:A` | `id=A` |
-| `/rajada n:10 intervaloms:100` | `n=10, intervaloMs=100` |
+| `/rajada n:10 intervaloms:100` | Agendamento e confirmação de 10 registos |
 
 O Discord exige nomes de opções em minúsculas. A opção `intervaloMs` do enunciado aparece no Discord como `intervaloms`.
 
@@ -54,4 +54,25 @@ O Discord exige nomes de opções em minúsculas. A opção `intervaloMs` do enu
 - Envia uma mensagem em `#arquivo` e outra noutro canal. Só a primeira deve receber resposta. Se houver outro bot disponível, confirma também que as mensagens dele são ignoradas.
 - Confirma que o token está apenas na sessão local e que o `.gitignore` exclui ficheiros locais de segredos, incluindo `master.key`.
 
-[Enunciado do Épico 2](https://github.com/cunhaestgv/SD-2026-2027/issues/19) · [Sprint E2-01](https://github.com/cunhaestgv/SD-2026-2027/issues/20)
+## 4. Validar o E2-02
+
+Usa uma pasta de teste local e uma única instância do líder por pasta.
+
+1. Executa `/registar texto:Olá` e anota o LSN. Na pasta do bot, verifica a linha em `registos.log` com `Get-Content .\registos.log -Tail 1`.
+2. Reinicia o bot e envia texto em `#arquivo`. O LSN deve ser o anterior mais um. Envia outra mensagem em `#general` e confirma que não aparece uma linha adicional.
+3. Com um chunk vazio, envia um só registo e aguarda cerca de 5 segundos. Confirma o par `.bin` e `.hdr` em `selados/` e o evento `SELADO` em `eventos-lider.txt`.
+4. Com o cargo `admin-arquivo`, executa `/rajada n:500 intervaloms:0`. Confirma que são produzidos vários chunks e que os intervalos de LSN são consecutivos. Vê os eventos com `Get-Content .\eventos-lider.txt -Tail 12`.
+5. Para verificar o nome de um `.bin`, compara-o com o resultado de `Get-FileHash .\selados\<chunkId>.bin -Algorithm SHA256`. Os testes de `mvn test` verificam ainda a abertura e a rejeição de alterações.
+
+## 5. Formatos e leitura do código
+
+- **`Registo` e `Arquivo.registar`.** O líder usa os IDs Discord do autor e do canal. Cada linha UTF-8 de `registos.log` guarda `lsn;instante;autor;canal;textoBase64`, seguida de LF. O instante usa ISO 8601 em UTC e o texto é codificado em Base64 a partir de UTF-8. O método sincronizado atribui o LSN e chama `force(true)` antes de confirmar. Base64 é uma codificação de texto e o log local é legível após descodificação.
+- **`Arquivo.retomar`.** Valida os chunks publicados e a sequência do log. Usa o último LSN do log e reconstrói a cauda que ainda não foi selada. Uma linha final sem LF é removida como escrita incompleta. Se a escrita falhar, consulta o terminal antes de reiniciar. Um registo pode ter sido gravado mesmo quando a resposta Discord não chega.
+- **`Chunk`.** O formato binário tem um inteiro de 4 bytes com o comprimento total dos dados, seguido de um ou mais pares de comprimento de 4 bytes e linha de registo UTF-8 sem LF. Os inteiros usam ordem big-endian. O padding é zero e completa o chunk até um múltiplo de `PAD_BYTES`. A leitura respeita o comprimento total para ignorar o padding. O limite de tamanho conta os comprimentos e os dados antes do padding. O registo que atinge ou ultrapassa o limite fica no chunk que é selado. O temporizador começa no primeiro registo.
+- **`ChunkCrypto`.** Deriva a DEK de 32 bytes da chave mestra e do salt com HKDF-SHA256. AES-256-GCM cifra o chunk com padding e autentica o cabeçalho. `open` verifica o SHA-256, a versão e a autenticação GCM, por esta ordem.
+- **Ficheiros selados.** O `.bin` contém os bytes cifrados seguidos da tag de 16 bytes. O SHA-256 hexadecimal minúsculo do `.bin` é o `chunkId`, usado também no nome do `.hdr` correspondente. O `.hdr` é UTF-8 e guarda `keyVersion;saltBase64;nonceBase64` seguido de LF. A versão é 1, com salt de 32 bytes e nonce de 12 bytes. A AAD é `tpf-v1` em ASCII, a versão de 4 bytes big-endian, o salt e o nonce. O tamanho múltiplo de `PAD_BYTES` aplica-se ao chunk antes de cifrar. O `.bin` inclui mais 16 bytes da tag.
+- **Eventos.** Cada linha de `eventos-lider.txt` segue `instante;evento;detalhe`. `REGISTO` indica o LSN. `SELADO` indica o ID do chunk, primeiro e último LSN e tamanho do `.bin`.
+
+Os parâmetros podem ser ajustados com `-Dtpf.chunkMaxBytes=65536`, `-Dtpf.padBytes=4096` e `-Dtpf.selagemMs=5000`. Guarda a `master.key` com os dados locais do líder para conseguires voltar a abrir os chunks.
+
+[Enunciado do Épico 2](https://github.com/cunhaestgv/SD-2026-2027/issues/19) · [Sprint E2-02](https://github.com/cunhaestgv/SD-2026-2027/issues/21)
